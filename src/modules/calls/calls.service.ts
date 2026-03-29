@@ -7,7 +7,7 @@ import {
   ForbiddenException,
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Repository, DataSource } from 'typeorm';
+import { Repository } from 'typeorm';
 import { ConfigService } from '@nestjs/config';
 import {
   CallSessionEntity,
@@ -21,22 +21,15 @@ import { EndCallDto } from './dto/end-call.dto';
 export class CallsService {
   private readonly logger = new Logger(CallsService.name);
 
-  /**
-   * Rate and minimum balance come from environment variables.
-   * Change them in .env without touching code.
-   * Default: ₹2/min, minimum ₹10 to start.
-   */
   private readonly ratePerMinute: number;
   private readonly minimumBalance: number;
 
   constructor(
     @InjectRepository(CallSessionEntity)
     private readonly callRepo: Repository<CallSessionEntity>,
-
     private readonly walletService: WalletService,
     private readonly usersService: UsersService,
     private readonly configService: ConfigService,
-    private readonly dataSource: DataSource,
   ) {
     this.ratePerMinute = Number(
       this.configService.get<number>('CALL_RATE_PER_MINUTE') ?? 2,
@@ -48,31 +41,33 @@ export class CallsService {
 
   // ───────────────────────────────────────────────────────────
   // INITIATE CALL
-  // Checks: no active call already running, sufficient balance
-  // Creates call_session row with status = active
+  // Runs active-call check and balance check in parallel.
+  // Both are read-only, no reason to run them sequentially.
   // ───────────────────────────────────────────────────────────
   async initiateCall(userId: string): Promise<CallSessionEntity> {
-    // Check: user doesn't already have an active call
-    const existing = await this.callRepo.findOne({
-      where: { caller_id: userId, status: CallSessionStatus.ACTIVE },
-    });
+    // Parallel: check existing call AND fetch wallet at the same time
+    // Sequential = 2 DB round trips. Parallel = 1 round trip (both fire together).
+    const [existing, wallet] = await Promise.all([
+      this.callRepo.findOne({
+        where: { caller_id: userId, status: CallSessionStatus.ACTIVE },
+        select: ['id'],  // only need to know it exists, not full row
+      }),
+      this.walletService.getWalletByUserId(userId),
+    ]);
+
     if (existing) {
       throw new ConflictException(
         'You already have an active call. End it before starting a new one.',
       );
     }
 
-    // Check: sufficient balance
-    const wallet = await this.walletService.getWalletByUserId(userId);
     const balance = Number(wallet.balance);
-
     if (balance < this.minimumBalance) {
       throw new BadRequestException(
-        `Insufficient balance. Minimum ₹${this.minimumBalance} required to start a call. Current balance: ₹${balance.toFixed(2)}`,
+        `Insufficient balance. Minimum ₹${this.minimumBalance} required. Current: ₹${balance.toFixed(2)}`,
       );
     }
 
-    // Create call session
     const session = this.callRepo.create({
       caller_id: userId,
       rate_per_minute: this.ratePerMinute,
@@ -87,46 +82,44 @@ export class CallsService {
 
   // ───────────────────────────────────────────────────────────
   // END CALL
-  // Calculates cost, debits wallet via WalletService (double-entry),
-  // updates session with duration + total_cost + status = ended
   //
-  // Idempotency: debit_idempotency_key = `call:{session_id}`
-  // If /end is called twice, second call returns 409 Conflict.
+  // BILLING FORMULA (exact second billing):
+  //   duration  = server NOW() - started_at  (pure server, no client input)
+  //   cost      = MAX(duration, 60) / 60 * rate_per_minute
+  //
+  // Examples:
+  //   30s  → MAX(30,60)/60  * 2 = ₹2.00  (minimum 1 min charge)
+  //   60s  → MAX(60,60)/60  * 2 = ₹2.00
+  //   61s  → MAX(61,60)/60  * 2 = ₹2.03  (exact — NOT rounded to 2 min)
+  //   90s  → MAX(90,60)/60  * 2 = ₹3.00
+  //   120s → MAX(120,60)/60 * 2 = ₹4.00
+  //
+  // No more CEIL(seconds/60) — that was the bug causing 61s = ₹4.
   // ───────────────────────────────────────────────────────────
   async endCall(userId: string, dto: EndCallDto): Promise<CallSessionEntity> {
     const session = await this.callRepo.findOne({
       where: { id: dto.session_id },
     });
 
-    if (!session) {
-      throw new NotFoundException('Call session not found.');
-    }
-
-    // Only the caller can end their own call
-    if (session.caller_id !== userId) {
-      throw new ForbiddenException('You can only end your own calls.');
-    }
-
+    if (!session) throw new NotFoundException('Call session not found.');
+    if (session.caller_id !== userId) throw new ForbiddenException('You can only end your own calls.');
     if (session.status !== CallSessionStatus.ACTIVE) {
-      throw new ConflictException(
-        `Call session is already ${session.status}. Cannot end again.`,
-      );
+      throw new ConflictException(`Call already ${session.status}.`);
     }
 
-    // Calculate duration
-    // Server-side duration = NOW() - started_at (seconds)
-    // Client sends their duration too.
-    // We use MAX(client, server) to prevent client sending 0 to dodge charges.
-    const serverDuration = Math.floor(
-      (Date.now() - new Date(session.started_at).getTime()) / 1000,
+    // Server-only duration — no client value used at all
+    const endedAt = new Date();
+    const durationSeconds = Math.floor(
+      (endedAt.getTime() - new Date(session.started_at).getTime()) / 1000,
     );
-    const finalDuration = Math.max(dto.duration_seconds, serverDuration);
 
-    // Calculate cost: CEIL(seconds / 60) * rate
-    // 1 second = 1 minute billed (minimum 1 minute)
-    // 61 seconds = 2 minutes billed
-    const minutesBilled = Math.ceil(finalDuration / 60);
-    const totalCost = Number((minutesBilled * this.ratePerMinute).toFixed(2));
+    // ── Exact billing formula ──
+    // Minimum charge: 60 seconds worth (₹2 at default rate)
+    // After 60s: billed per exact second
+    const billableSeconds = Math.max(durationSeconds, 60);
+    const totalCost = Number(
+      ((billableSeconds / 60) * this.ratePerMinute).toFixed(2),
+    );
 
     const idempotencyKey = `call:${session.id}`;
 
@@ -135,61 +128,57 @@ export class CallsService {
       await this.walletService.debit(
         userId,
         totalCost,
-        `Call charge — ${minutesBilled} min @ ₹${this.ratePerMinute}/min`,
+        `Call charge — ${durationSeconds}s @ ₹${this.ratePerMinute}/min`,
         { idempotencyKey },
       );
     } catch (err) {
-      // If wallet debit fails due to insufficient funds mid-call
       if (err instanceof BadRequestException) {
         await this.callRepo.update(
           { id: session.id },
           {
             status: CallSessionStatus.INSUFFICIENT_FUNDS,
-            duration_seconds: finalDuration,
-            ended_at: new Date(),
+            duration_seconds: durationSeconds,
+            ended_at: endedAt,
             failure_reason: 'Insufficient balance at call end',
           },
         );
         throw new BadRequestException(
-          'Insufficient balance to cover call charges. Call marked as unpaid.',
+          'Insufficient balance to cover call charges.',
         );
       }
       throw err;
     }
 
-    // Update session to ended
     await this.callRepo.update(
       { id: session.id },
       {
         status: CallSessionStatus.ENDED,
-        duration_seconds: finalDuration,
+        duration_seconds: durationSeconds,
         total_cost: totalCost,
-        ended_at: new Date(),
+        ended_at: endedAt,
         debit_idempotency_key: idempotencyKey,
       },
     );
 
     this.logger.log(
-      `Call ended: session=${session.id} duration=${finalDuration}s billed=${minutesBilled}min cost=₹${totalCost}`,
+      `Call ended: session=${session.id} duration=${durationSeconds}s cost=₹${totalCost}`,
     );
 
     return this.callRepo.findOne({ where: { id: session.id } });
   }
 
   // ───────────────────────────────────────────────────────────
-  // GET ACTIVE CALL
-  // Returns active call session if one exists, null otherwise.
-  // Frontend polls this to show live call state.
+  // GET ACTIVE CALL — select only needed columns
   // ───────────────────────────────────────────────────────────
   async getActiveCall(userId: string): Promise<CallSessionEntity | null> {
     return this.callRepo.findOne({
       where: { caller_id: userId, status: CallSessionStatus.ACTIVE },
+      select: ['id', 'rate_per_minute', 'balance_at_start', 'status', 'started_at'],
     });
   }
 
   // ───────────────────────────────────────────────────────────
-  // CALL HISTORY
-  // Paginated, newest first.
+  // CALL HISTORY — select only columns needed for list view
   // ───────────────────────────────────────────────────────────
   async getCallHistory(
     userId: string,
@@ -202,6 +191,11 @@ export class CallsService {
       order: { started_at: 'DESC' },
       skip,
       take: limit,
+      select: [
+        'id', 'status', 'duration_seconds', 'total_cost',
+        'rate_per_minute', 'balance_at_start', 'started_at',
+        'ended_at', 'failure_reason',
+      ],
     });
     return { sessions, total, page, limit };
   }

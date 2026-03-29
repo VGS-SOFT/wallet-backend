@@ -17,11 +17,6 @@ import { TransactionQueryDto } from '../wallet/dto/transaction-query.dto';
 export class CallsController {
   constructor(private readonly callsService: CallsService) {}
 
-  /**
-   * POST /calls/initiate
-   * Starts a new call session.
-   * Checks: no existing active call, balance >= minimum.
-   */
   @Post('initiate')
   @HttpCode(HttpStatus.CREATED)
   async initiateCall(@CurrentUser() user: UserEntity) {
@@ -38,10 +33,6 @@ export class CallsController {
     };
   }
 
-  /**
-   * POST /calls/end
-   * Ends an active call, calculates cost, debits wallet.
-   */
   @Post('end')
   @HttpCode(HttpStatus.OK)
   async endCall(
@@ -55,7 +46,6 @@ export class CallsController {
         id: session.id,
         status: session.status,
         duration_seconds: session.duration_seconds,
-        minutes_billed: Math.ceil(session.duration_seconds / 60),
         rate_per_minute: Number(session.rate_per_minute),
         total_cost: Number(session.total_cost),
         started_at: session.started_at,
@@ -64,11 +54,6 @@ export class CallsController {
     };
   }
 
-  /**
-   * GET /calls/active
-   * Returns current active call if one exists.
-   * Frontend uses this to restore call UI on page refresh.
-   */
   @Get('active')
   async getActiveCall(@CurrentUser() user: UserEntity) {
     const session = await this.callsService.getActiveCall(user.id);
@@ -86,10 +71,6 @@ export class CallsController {
     };
   }
 
-  /**
-   * GET /calls/history
-   * Paginated call history for the logged-in user.
-   */
   @Get('history')
   async getCallHistory(
     @CurrentUser() user: UserEntity,
@@ -105,9 +86,6 @@ export class CallsController {
         id: s.id,
         status: s.status,
         duration_seconds: s.duration_seconds,
-        minutes_billed: s.duration_seconds
-          ? Math.ceil(s.duration_seconds / 60)
-          : null,
         rate_per_minute: Number(s.rate_per_minute),
         total_cost: s.total_cost ? Number(s.total_cost) : null,
         balance_at_start: Number(s.balance_at_start),
