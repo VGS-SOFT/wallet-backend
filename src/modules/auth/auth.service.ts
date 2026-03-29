@@ -1,4 +1,4 @@
-import { Injectable, Inject } from '@nestjs/common';
+import { Injectable, Inject, Logger } from '@nestjs/common';
 import { JwtService } from '@nestjs/jwt';
 import { UsersService } from '../users/users.service';
 import { GoogleProfile, JwtPayload } from '../users/user.types';
@@ -8,6 +8,8 @@ import { Redis } from '@upstash/redis';
 
 @Injectable()
 export class AuthService {
+  private readonly logger = new Logger(AuthService.name);
+
   constructor(
     private readonly usersService: UsersService,
     private readonly jwtService: JwtService,
@@ -16,32 +18,25 @@ export class AuthService {
 
   /**
    * Called after Google OAuth succeeds.
-   * Finds or creates the user, then issues a JWT.
+   * Uses upsert-based findOrCreate — safe for concurrent requests.
    */
   async validateGoogleUser(profile: GoogleProfile): Promise<UserEntity> {
-    let user = await this.usersService.findByGoogleId(profile.google_id);
-    if (!user) {
-      user = await this.usersService.createWithWallet(profile);
-    }
-    return user;
+    return this.usersService.findOrCreateWithWallet(profile);
   }
 
   /**
-   * Issues a signed JWT token for the user.
-   * Also caches the user ID in Redis for fast lookup.
+   * Issues a signed JWT. Also caches session in Redis.
    */
   async generateToken(user: UserEntity): Promise<string> {
     const payload: JwtPayload = { sub: user.id, email: user.email };
     const token = this.jwtService.sign(payload);
-
-    // Cache user session in Redis (TTL: 7 days in seconds)
+    // Cache session in Redis — TTL 7 days
     await this.redis.setex(`session:${user.id}`, 604800, user.email);
-
     return token;
   }
 
   /**
-   * Validates JWT payload — used by JwtStrategy.
+   * Validates JWT payload — used by JwtStrategy on every protected request.
    */
   async validateJwtPayload(payload: JwtPayload): Promise<UserEntity | null> {
     return this.usersService.findById(payload.sub);
