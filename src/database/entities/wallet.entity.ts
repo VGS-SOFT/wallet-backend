@@ -5,9 +5,11 @@ import {
   CreateDateColumn,
   UpdateDateColumn,
   OneToOne,
+  OneToMany,
   JoinColumn,
 } from 'typeorm';
 import { UserEntity } from './user.entity';
+import { WalletTransactionEntity } from './wallet-transaction.entity';
 
 @Entity('wallets')
 export class WalletEntity {
@@ -29,4 +31,7 @@ export class WalletEntity {
   @OneToOne(() => UserEntity, (user) => user.wallet)
   @JoinColumn({ name: 'user_id' })
   user: UserEntity;
+
+  @OneToMany(() => WalletTransactionEntity, (tx) => tx.wallet)
+  transactions: WalletTransactionEntity[];
 }
