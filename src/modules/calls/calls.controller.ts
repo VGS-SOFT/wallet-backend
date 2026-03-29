@@ -7,6 +7,8 @@ import {
   HttpCode,
   HttpStatus,
 } from '@nestjs/common';
+import { createClient } from '@supabase/supabase-js';
+import { ConfigService } from '@nestjs/config';
 import { CallsService } from './calls.service';
 import { CurrentUser } from '../../common/decorators/current-user.decorator';
 import { UserEntity } from '../../database/entities/user.entity';
@@ -15,7 +17,19 @@ import { TransactionQueryDto } from '../wallet/dto/transaction-query.dto';
 
 @Controller('calls')
 export class CallsController {
-  constructor(private readonly callsService: CallsService) {}
+  // Supabase admin client — used to generate signed URLs for recordings
+  // Service role key bypasses RLS so the backend can read any user's recording
+  private readonly supabase;
+
+  constructor(
+    private readonly callsService: CallsService,
+    private readonly configService: ConfigService,
+  ) {
+    this.supabase = createClient(
+      this.configService.get<string>('SUPABASE_URL'),
+      this.configService.get<string>('SUPABASE_SERVICE_ROLE_KEY'),
+    );
+  }
 
   @Post('initiate')
   @HttpCode(HttpStatus.CREATED)
@@ -50,6 +64,7 @@ export class CallsController {
         total_cost: Number(session.total_cost),
         started_at: session.started_at,
         ended_at: session.ended_at,
+        recording_url: session.recording_url ?? null,
       },
     };
   }
@@ -81,18 +96,37 @@ export class CallsController {
       query.page,
       query.limit,
     );
+
+    // Generate signed URLs for any sessions that have recordings
+    // Signed URLs expire in 1 hour — frontend can play but not hotlink permanently
+    const sessions = await Promise.all(
+      result.sessions.map(async (s) => {
+        let signedRecordingUrl: string | null = null;
+
+        if (s.recording_url) {
+          const { data } = await this.supabase.storage
+            .from('call-recordings')
+            .createSignedUrl(s.recording_url, 3600); // 1 hour expiry
+          signedRecordingUrl = data?.signedUrl ?? null;
+        }
+
+        return {
+          id: s.id,
+          status: s.status,
+          duration_seconds: s.duration_seconds,
+          rate_per_minute: Number(s.rate_per_minute),
+          total_cost: s.total_cost ? Number(s.total_cost) : null,
+          balance_at_start: Number(s.balance_at_start),
+          started_at: s.started_at,
+          ended_at: s.ended_at,
+          failure_reason: s.failure_reason,
+          recording_url: signedRecordingUrl,
+        };
+      }),
+    );
+
     return {
-      sessions: result.sessions.map((s) => ({
-        id: s.id,
-        status: s.status,
-        duration_seconds: s.duration_seconds,
-        rate_per_minute: Number(s.rate_per_minute),
-        total_cost: s.total_cost ? Number(s.total_cost) : null,
-        balance_at_start: Number(s.balance_at_start),
-        started_at: s.started_at,
-        ended_at: s.ended_at,
-        failure_reason: s.failure_reason,
-      })),
+      sessions,
       pagination: {
         total: result.total,
         page: result.page,

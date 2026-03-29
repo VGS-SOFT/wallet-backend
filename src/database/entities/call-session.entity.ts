@@ -23,26 +23,15 @@ export class CallSessionEntity {
   @Column()
   caller_id: string;
 
-  /**
-   * Rate stored at call time — immutable after creation.
-   * If we change CALL_RATE_PER_MINUTE tomorrow,
-   * old call records still reflect the rate that was active.
-   */
   @Column({ type: 'decimal', precision: 10, scale: 2 })
   rate_per_minute: number;
 
-  /**
-   * Duration in seconds (precise).
-   * Billed minutes = Math.ceil(duration_seconds / 60)
-   * Storing seconds gives maximum precision for future billing models.
-   */
   @Column({ type: 'int', nullable: true })
   duration_seconds: number;
 
   @Column({ type: 'decimal', precision: 10, scale: 2, nullable: true })
   total_cost: number;
 
-  /** Balance snapshot at call start — for audit trail */
   @Column({ type: 'decimal', precision: 10, scale: 2 })
   balance_at_start: number;
 
@@ -53,13 +42,18 @@ export class CallSessionEntity {
   })
   status: CallSessionStatus;
 
-  /**
-   * Idempotency key for the debit transaction.
-   * Format: `call:{session_id}`
-   * Prevents double-debit if /calls/end is called twice.
-   */
   @Column({ nullable: true, unique: true })
   debit_idempotency_key: string;
+
+  /**
+   * Supabase Storage path to the call recording.
+   * Format: {user_id}/{session_id}.webm
+   * Stored as the full storage path, NOT a signed URL.
+   * Signed URLs are generated on-demand in the controller.
+   * This keeps the stored value permanent even if signed URLs expire.
+   */
+  @Column({ type: 'text', nullable: true })
+  recording_url: string | null;
 
   @CreateDateColumn()
   started_at: Date;

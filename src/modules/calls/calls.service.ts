@@ -39,18 +39,12 @@ export class CallsService {
     );
   }
 
-  // ───────────────────────────────────────────────────────────
-  // INITIATE CALL
-  // Runs active-call check and balance check in parallel.
-  // Both are read-only, no reason to run them sequentially.
-  // ───────────────────────────────────────────────────────────
+  // ─── INITIATE CALL ────────────────────────────────────────────────
   async initiateCall(userId: string): Promise<CallSessionEntity> {
-    // Parallel: check existing call AND fetch wallet at the same time
-    // Sequential = 2 DB round trips. Parallel = 1 round trip (both fire together).
     const [existing, wallet] = await Promise.all([
       this.callRepo.findOne({
         where: { caller_id: userId, status: CallSessionStatus.ACTIVE },
-        select: ['id'],  // only need to know it exists, not full row
+        select: ['id'],
       }),
       this.walletService.getWalletByUserId(userId),
     ]);
@@ -80,21 +74,9 @@ export class CallsService {
     return saved;
   }
 
-  // ───────────────────────────────────────────────────────────
-  // END CALL
-  //
-  // BILLING FORMULA (exact second billing):
-  //   duration  = server NOW() - started_at  (pure server, no client input)
-  //   cost      = MAX(duration, 60) / 60 * rate_per_minute
-  //
-  // Examples:
-  //   30s  → MAX(30,60)/60  * 2 = ₹2.00  (minimum 1 min charge)
-  //   60s  → MAX(60,60)/60  * 2 = ₹2.00
-  //   61s  → MAX(61,60)/60  * 2 = ₹2.03  (exact — NOT rounded to 2 min)
-  //   90s  → MAX(90,60)/60  * 2 = ₹3.00
-  //   120s → MAX(120,60)/60 * 2 = ₹4.00
-  //
-  // No more CEIL(seconds/60) — that was the bug causing 61s = ₹4.
+  // ─── END CALL ───────────────────────────────────────────────────
+  // Billing: MAX(duration, 60) / 60 * rate  (exact per-second after 1 min)
+  // Recording: optional storage path saved if provided
   // ───────────────────────────────────────────────────────────
   async endCall(userId: string, dto: EndCallDto): Promise<CallSessionEntity> {
     const session = await this.callRepo.findOne({
@@ -107,15 +89,11 @@ export class CallsService {
       throw new ConflictException(`Call already ${session.status}.`);
     }
 
-    // Server-only duration — no client value used at all
     const endedAt = new Date();
     const durationSeconds = Math.floor(
       (endedAt.getTime() - new Date(session.started_at).getTime()) / 1000,
     );
 
-    // ── Exact billing formula ──
-    // Minimum charge: 60 seconds worth (₹2 at default rate)
-    // After 60s: billed per exact second
     const billableSeconds = Math.max(durationSeconds, 60);
     const totalCost = Number(
       ((billableSeconds / 60) * this.ratePerMinute).toFixed(2),
@@ -123,7 +101,6 @@ export class CallsService {
 
     const idempotencyKey = `call:${session.id}`;
 
-    // Debit wallet — double-entry, atomic, idempotency-protected
     try {
       await this.walletService.debit(
         userId,
@@ -142,9 +119,7 @@ export class CallsService {
             failure_reason: 'Insufficient balance at call end',
           },
         );
-        throw new BadRequestException(
-          'Insufficient balance to cover call charges.',
-        );
+        throw new BadRequestException('Insufficient balance to cover call charges.');
       }
       throw err;
     }
@@ -157,19 +132,19 @@ export class CallsService {
         total_cost: totalCost,
         ended_at: endedAt,
         debit_idempotency_key: idempotencyKey,
+        // Store recording path if provided — null if user denied mic
+        recording_url: dto.recording_path ?? null,
       },
     );
 
     this.logger.log(
-      `Call ended: session=${session.id} duration=${durationSeconds}s cost=₹${totalCost}`,
+      `Call ended: session=${session.id} duration=${durationSeconds}s cost=₹${totalCost} recording=${dto.recording_path ?? 'none'}`,
     );
 
     return this.callRepo.findOne({ where: { id: session.id } });
   }
 
-  // ───────────────────────────────────────────────────────────
-  // GET ACTIVE CALL — select only needed columns
-  // ───────────────────────────────────────────────────────────
+  // ─── GET ACTIVE CALL ───────────────────────────────────────────────
   async getActiveCall(userId: string): Promise<CallSessionEntity | null> {
     return this.callRepo.findOne({
       where: { caller_id: userId, status: CallSessionStatus.ACTIVE },
@@ -177,9 +152,7 @@ export class CallsService {
     });
   }
 
-  // ───────────────────────────────────────────────────────────
-  // CALL HISTORY — select only columns needed for list view
-  // ───────────────────────────────────────────────────────────
+  // ─── CALL HISTORY ─────────────────────────────────────────────────
   async getCallHistory(
     userId: string,
     page = 1,
@@ -194,7 +167,7 @@ export class CallsService {
       select: [
         'id', 'status', 'duration_seconds', 'total_cost',
         'rate_per_minute', 'balance_at_start', 'started_at',
-        'ended_at', 'failure_reason',
+        'ended_at', 'failure_reason', 'recording_url',
       ],
     });
     return { sessions, total, page, limit };
