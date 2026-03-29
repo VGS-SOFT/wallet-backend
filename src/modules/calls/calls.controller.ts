@@ -7,7 +7,6 @@ import {
   HttpCode,
   HttpStatus,
 } from '@nestjs/common';
-import { createClient } from '@supabase/supabase-js';
 import { ConfigService } from '@nestjs/config';
 import { CallsService } from './calls.service';
 import { CurrentUser } from '../../common/decorators/current-user.decorator';
@@ -17,18 +16,45 @@ import { TransactionQueryDto } from '../wallet/dto/transaction-query.dto';
 
 @Controller('calls')
 export class CallsController {
-  // Supabase admin client — used to generate signed URLs for recordings
-  // Service role key bypasses RLS so the backend can read any user's recording
-  private readonly supabase;
+  private readonly supabaseUrl: string;
+  private readonly supabaseServiceKey: string;
 
   constructor(
     private readonly callsService: CallsService,
     private readonly configService: ConfigService,
   ) {
-    this.supabase = createClient(
-      this.configService.get<string>('SUPABASE_URL'),
-      this.configService.get<string>('SUPABASE_SERVICE_ROLE_KEY'),
-    );
+    this.supabaseUrl = this.configService.get<string>('SUPABASE_URL');
+    this.supabaseServiceKey = this.configService.get<string>('SUPABASE_SERVICE_ROLE_KEY');
+  }
+
+  /**
+   * Generate a signed URL for a Supabase Storage object using the REST API.
+   * No supabase-js package required — pure fetch.
+   * Service role key bypasses RLS so backend can sign any user's recording.
+   * Signed URLs expire in 1 hour (3600 seconds).
+   */
+  private async createSignedUrl(storagePath: string): Promise<string | null> {
+    try {
+      const res = await fetch(
+        `${this.supabaseUrl}/storage/v1/object/sign/call-recordings/${storagePath}`,
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${this.supabaseServiceKey}`,
+            apikey: this.supabaseServiceKey,
+          },
+          body: JSON.stringify({ expiresIn: 3600 }),
+        },
+      );
+      if (!res.ok) return null;
+      const json = await res.json() as { signedURL?: string };
+      return json.signedURL
+        ? `${this.supabaseUrl}/storage/v1${json.signedURL}`
+        : null;
+    } catch {
+      return null;
+    }
   }
 
   @Post('initiate')
@@ -97,32 +123,22 @@ export class CallsController {
       query.limit,
     );
 
-    // Generate signed URLs for any sessions that have recordings
-    // Signed URLs expire in 1 hour — frontend can play but not hotlink permanently
+    // Generate signed URLs for sessions with recordings — all in parallel
     const sessions = await Promise.all(
-      result.sessions.map(async (s) => {
-        let signedRecordingUrl: string | null = null;
-
-        if (s.recording_url) {
-          const { data } = await this.supabase.storage
-            .from('call-recordings')
-            .createSignedUrl(s.recording_url, 3600); // 1 hour expiry
-          signedRecordingUrl = data?.signedUrl ?? null;
-        }
-
-        return {
-          id: s.id,
-          status: s.status,
-          duration_seconds: s.duration_seconds,
-          rate_per_minute: Number(s.rate_per_minute),
-          total_cost: s.total_cost ? Number(s.total_cost) : null,
-          balance_at_start: Number(s.balance_at_start),
-          started_at: s.started_at,
-          ended_at: s.ended_at,
-          failure_reason: s.failure_reason,
-          recording_url: signedRecordingUrl,
-        };
-      }),
+      result.sessions.map(async (s) => ({
+        id: s.id,
+        status: s.status,
+        duration_seconds: s.duration_seconds,
+        rate_per_minute: Number(s.rate_per_minute),
+        total_cost: s.total_cost ? Number(s.total_cost) : null,
+        balance_at_start: Number(s.balance_at_start),
+        started_at: s.started_at,
+        ended_at: s.ended_at,
+        failure_reason: s.failure_reason,
+        recording_url: s.recording_url
+          ? await this.createSignedUrl(s.recording_url)
+          : null,
+      })),
     );
 
     return {
