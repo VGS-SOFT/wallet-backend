@@ -6,57 +6,34 @@ import {
   Query,
   HttpCode,
   HttpStatus,
+  BadRequestException,
+  ForbiddenException,
+  NotFoundException,
 } from '@nestjs/common';
-import { ConfigService } from '@nestjs/config';
+import { InjectRepository } from '@nestjs/typeorm';
+import { Repository } from 'typeorm';
 import { CallsService } from './calls.service';
+import { StorageService } from '../storage/storage.service';
 import { CurrentUser } from '../../common/decorators/current-user.decorator';
 import { UserEntity } from '../../database/entities/user.entity';
 import { EndCallDto } from './dto/end-call.dto';
+import { RecordingTokenDto } from './dto/recording-token.dto';
 import { TransactionQueryDto } from '../wallet/dto/transaction-query.dto';
+import {
+  CallSessionEntity,
+  CallSessionStatus,
+} from '../../database/entities/call-session.entity';
 
 @Controller('calls')
 export class CallsController {
-  private readonly supabaseUrl: string;
-  private readonly supabaseServiceKey: string;
-
   constructor(
     private readonly callsService: CallsService,
-    private readonly configService: ConfigService,
-  ) {
-    this.supabaseUrl = this.configService.get<string>('SUPABASE_URL');
-    this.supabaseServiceKey = this.configService.get<string>('SUPABASE_SERVICE_ROLE_KEY');
-  }
+    private readonly storageService: StorageService,
+    @InjectRepository(CallSessionEntity)
+    private readonly callRepo: Repository<CallSessionEntity>,
+  ) {}
 
-  /**
-   * Generate a signed URL for a Supabase Storage object using the REST API.
-   * No supabase-js package required — pure fetch.
-   * Service role key bypasses RLS so backend can sign any user's recording.
-   * Signed URLs expire in 1 hour (3600 seconds).
-   */
-  private async createSignedUrl(storagePath: string): Promise<string | null> {
-    try {
-      const res = await fetch(
-        `${this.supabaseUrl}/storage/v1/object/sign/call-recordings/${storagePath}`,
-        {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            Authorization: `Bearer ${this.supabaseServiceKey}`,
-            apikey: this.supabaseServiceKey,
-          },
-          body: JSON.stringify({ expiresIn: 3600 }),
-        },
-      );
-      if (!res.ok) return null;
-      const json = await res.json() as { signedURL?: string };
-      return json.signedURL
-        ? `${this.supabaseUrl}/storage/v1${json.signedURL}`
-        : null;
-    } catch {
-      return null;
-    }
-  }
-
+  // ─── INITIATE ────────────────────────────────────────────────────────
   @Post('initiate')
   @HttpCode(HttpStatus.CREATED)
   async initiateCall(@CurrentUser() user: UserEntity) {
@@ -73,6 +50,51 @@ export class CallsController {
     };
   }
 
+  // ─── RECORDING UPLOAD TOKEN ──────────────────────────────────────────
+  /**
+   * Issues a pre-signed Supabase Storage upload URL.
+   *
+   * Security:
+   *   1. JWT verified (guard runs before this)
+   *   2. session_id must belong to the calling user AND be active
+   *      → prevents user A getting an upload token for user B's session
+   *   3. Storage path is constructed server-side: {userId}/{sessionId}.{ext}
+   *      → client cannot choose an arbitrary path
+   *   4. Signed URL valid for 5 minutes, single-use
+   *   5. Service role key stays on backend — never sent to client
+   */
+  @Post('recording-token')
+  @HttpCode(HttpStatus.OK)
+  async getRecordingToken(
+    @CurrentUser() user: UserEntity,
+    @Body() dto: RecordingTokenDto,
+  ) {
+    // Verify session belongs to this user and is currently active
+    const session = await this.callRepo.findOne({
+      where: { id: dto.session_id, caller_id: user.id },
+      select: ['id', 'caller_id', 'status'],
+    });
+
+    if (!session) throw new NotFoundException('Session not found.');
+    if (session.status !== CallSessionStatus.ACTIVE) {
+      throw new BadRequestException('Can only upload recording for an active call.');
+    }
+    if (session.caller_id !== user.id) {
+      throw new ForbiddenException('Forbidden.');
+    }
+
+    // Path is fully server-controlled — client has no say in where it goes
+    const storagePath = `${user.id}/${dto.session_id}.${dto.extension}`;
+    const { signedUrl, token, path } = await this.storageService.createSignedUploadUrl(storagePath);
+
+    return {
+      signedUrl,  // PUT this URL with the audio blob
+      token,      // attach as header: x-upsert or used internally by supabase-js
+      path,       // send this back in /calls/end as recording_path
+    };
+  }
+
+  // ─── END CALL ────────────────────────────────────────────────────────
   @Post('end')
   @HttpCode(HttpStatus.OK)
   async endCall(
@@ -95,6 +117,7 @@ export class CallsController {
     };
   }
 
+  // ─── ACTIVE CALL ─────────────────────────────────────────────────────
   @Get('active')
   async getActiveCall(@CurrentUser() user: UserEntity) {
     const session = await this.callsService.getActiveCall(user.id);
@@ -112,6 +135,7 @@ export class CallsController {
     };
   }
 
+  // ─── HISTORY ─────────────────────────────────────────────────────────
   @Get('history')
   async getCallHistory(
     @CurrentUser() user: UserEntity,
@@ -123,7 +147,7 @@ export class CallsController {
       query.limit,
     );
 
-    // Generate signed URLs for sessions with recordings — all in parallel
+    // Generate signed read URLs in parallel — all expire in 1 hour
     const sessions = await Promise.all(
       result.sessions.map(async (s) => ({
         id: s.id,
@@ -136,7 +160,7 @@ export class CallsController {
         ended_at: s.ended_at,
         failure_reason: s.failure_reason,
         recording_url: s.recording_url
-          ? await this.createSignedUrl(s.recording_url)
+          ? await this.storageService.createSignedReadUrl(s.recording_url)
           : null,
       })),
     );
