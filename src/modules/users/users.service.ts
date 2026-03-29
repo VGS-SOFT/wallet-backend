@@ -1,4 +1,4 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { Injectable, Logger, InternalServerErrorException } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository, DataSource } from 'typeorm';
 import { UserEntity } from '../../database/entities/user.entity';
@@ -23,25 +23,37 @@ export class UsersService {
     return this.userRepo.findOne({ where: { google_id: googleId } });
   }
 
+  /**
+   * Lightweight findById — used by JwtStrategy on EVERY request.
+   * Does NOT load wallet relation here — that would be a JOIN on every
+   * authenticated request, which is expensive and unnecessary.
+   * Wallet is loaded only when explicitly needed (e.g. wallet routes).
+   */
   async findById(id: string): Promise<UserEntity | null> {
+    return this.userRepo.findOne({ where: { id } });
+  }
+
+  /**
+   * findByIdWithWallet — loads user + wallet relation.
+   * Used only when wallet data is explicitly needed.
+   */
+  async findByIdWithWallet(id: string): Promise<UserEntity | null> {
     return this.userRepo.findOne({ where: { id }, relations: ['wallet'] });
   }
 
   /**
    * Production-grade find-or-create using PostgreSQL upsert.
    *
-   * Problem with naive find -> check -> insert:
-   *   Two simultaneous requests both pass the find check,
-   *   both attempt INSERT — one crashes with unique constraint violation.
+   * Race-condition safe: INSERT ... ON CONFLICT DO NOTHING.
+   * Even if two requests hit simultaneously, PostgreSQL handles the conflict
+   * atomically — only one INSERT succeeds, both requests then fetch the same row.
    *
-   * Solution: INSERT ... ON CONFLICT DO NOTHING (upsert).
-   *   - If user doesn’t exist: inserts and creates wallet atomically.
-   *   - If user already exists: conflict is silently ignored, then we fetch.
-   *   - Race-condition safe: even concurrent requests resolve correctly.
+   * Null-safety: throws InternalServerErrorException if user cannot be fetched
+   * after upsert — prevents silent null propagation downstream.
    */
   async findOrCreateWithWallet(profile: GoogleProfile): Promise<UserEntity> {
     return this.dataSource.transaction(async (manager) => {
-      // Upsert user — ON CONFLICT (google_id) DO NOTHING
+      // Upsert user
       await manager
         .createQueryBuilder()
         .insert()
@@ -52,15 +64,25 @@ export class UsersService {
           name: profile.name,
           avatar_url: profile.avatar_url,
         })
-        .orIgnore() // ON CONFLICT DO NOTHING
+        .orIgnore()
         .execute();
 
-      // Fetch the user (whether just created or already existed)
+      // Fetch user after upsert
       const user = await manager.findOne(UserEntity, {
         where: { google_id: profile.google_id },
       });
 
-      // Upsert wallet — ON CONFLICT (user_id) DO NOTHING
+      // Null safety — should never happen, but must be guarded
+      if (!user) {
+        this.logger.error(
+          `findOrCreateWithWallet: user not found after upsert for google_id=${profile.google_id}`,
+        );
+        throw new InternalServerErrorException(
+          'User could not be created. Please try again.',
+        );
+      }
+
+      // Upsert wallet
       await manager
         .createQueryBuilder()
         .insert()
@@ -69,7 +91,7 @@ export class UsersService {
           user_id: user.id,
           balance: 0.0,
         })
-        .orIgnore() // wallet may already exist for returning users
+        .orIgnore()
         .execute();
 
       return user;
