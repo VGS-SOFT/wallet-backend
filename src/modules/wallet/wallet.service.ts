@@ -3,11 +3,27 @@ import {
   Logger,
   NotFoundException,
   BadRequestException,
+  ConflictException,
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Repository, DataSource } from 'typeorm';
+import { Repository, DataSource, QueryFailedError } from 'typeorm';
 import { WalletEntity } from '../../database/entities/wallet.entity';
-import { WalletTransactionEntity, TransactionType } from '../../database/entities/wallet-transaction.entity';
+import {
+  WalletTransactionEntity,
+  TransactionType,
+  EntryType,
+  AccountType,
+} from '../../database/entities/wallet-transaction.entity';
+import { PlatformAccountEntity } from '../../database/entities/platform-account.entity';
+import {
+  PlatformAccountTransactionEntity,
+  EntryType as PlatformEntryType,
+} from '../../database/entities/platform-account-transaction.entity';
+import {
+  TopUpOrderEntity,
+  TopUpOrderStatus,
+  PaymentGateway,
+} from '../../database/entities/topup-order.entity';
 import { TopUpDto } from './dto/topup.dto';
 import { TransactionQueryDto } from './dto/transaction-query.dto';
 
@@ -22,129 +38,232 @@ export class WalletService {
     @InjectRepository(WalletTransactionEntity)
     private readonly txRepo: Repository<WalletTransactionEntity>,
 
+    @InjectRepository(PlatformAccountEntity)
+    private readonly platformAccountRepo: Repository<PlatformAccountEntity>,
+
+    @InjectRepository(PlatformAccountTransactionEntity)
+    private readonly platformTxRepo: Repository<PlatformAccountTransactionEntity>,
+
+    @InjectRepository(TopUpOrderEntity)
+    private readonly topUpOrderRepo: Repository<TopUpOrderEntity>,
+
     private readonly dataSource: DataSource,
   ) {}
 
-  /**
-   * Get wallet by user_id.
-   * Throws NotFoundException if wallet doesn't exist.
-   */
-  async getWalletByUserId(userId: string): Promise<WalletEntity> {
-    const wallet = await this.walletRepo.findOne({ where: { user_id: userId } });
-    if (!wallet) {
-      throw new NotFoundException('Wallet not found for this user.');
-    }
+  // ─────────────────────────────────────────────────────────
+  // INTERNAL HELPERS
+  // ─────────────────────────────────────────────────────────
+
+  private async getWalletLocked(userId: string, manager: any): Promise<WalletEntity> {
+    const wallet = await manager.getRepository(WalletEntity).findOne({
+      where: { user_id: userId },
+      lock: { mode: 'pessimistic_write' },
+    });
+    if (!wallet) throw new NotFoundException('Wallet not found.');
     return wallet;
   }
 
-  /**
-   * Top-up wallet balance.
-   *
-   * Uses PESSIMISTIC_WRITE lock inside a transaction.
-   * Why: If two top-up requests hit simultaneously, without locking
-   * both read balance=100, both add 500, both write 600 — one credit is lost.
-   * With pessimistic lock: second request waits until first commits.
-   * This guarantees correct balance under any concurrency scenario.
-   */
-  async topUp(userId: string, dto: TopUpDto): Promise<WalletTransactionEntity> {
+  private async getPlatformAccountLocked(slug: string, manager: any): Promise<PlatformAccountEntity> {
+    const account = await manager.getRepository(PlatformAccountEntity).findOne({
+      where: { slug },
+      lock: { mode: 'pessimistic_write' },
+    });
+    if (!account) throw new NotFoundException(`Platform account '${slug}' not found.`);
+    return account;
+  }
+
+  // ─────────────────────────────────────────────────────────
+  // PUBLIC: GET BALANCE
+  // ─────────────────────────────────────────────────────────
+
+  async getWalletByUserId(userId: string): Promise<WalletEntity> {
+    const wallet = await this.walletRepo.findOne({ where: { user_id: userId } });
+    if (!wallet) throw new NotFoundException('Wallet not found for this user.');
+    return wallet;
+  }
+
+  // ─────────────────────────────────────────────────────────
+  // PUBLIC: TOP-UP (MANUAL — no payment gateway yet)
+  //
+  // Double-entry flow:
+  //   DEBIT  Escrow Account      (money arrived from outside)
+  //   CREDIT User Wallet         (money credited to user)
+  //
+  // When Razorpay is integrated, this same method is called
+  // from the webhook handler AFTER payment is confirmed.
+  // The topup_order_id becomes the idempotency_key.
+  // ─────────────────────────────────────────────────────────
+
+  async topUp(
+    userId: string,
+    dto: TopUpDto,
+    options?: { idempotencyKey?: string; paymentReference?: string; gateway?: PaymentGateway },
+  ): Promise<WalletTransactionEntity> {
     return this.dataSource.transaction(async (manager) => {
-      // Lock the wallet row for this transaction
-      const wallet = await manager
-        .getRepository(WalletEntity)
-        .findOne({
-          where: { user_id: userId },
-          lock: { mode: 'pessimistic_write' },
-        });
+      // Lock both accounts atomically
+      const [wallet, escrowAccount] = await Promise.all([
+        this.getWalletLocked(userId, manager),
+        this.getPlatformAccountLocked('escrow', manager),
+      ]);
 
-      if (!wallet) {
-        throw new NotFoundException('Wallet not found.');
-      }
+      const amount = Number(Number(dto.amount).toFixed(2));
+      const newWalletBalance = Number((Number(wallet.balance) + amount).toFixed(2));
+      const newEscrowBalance = Number((Number(escrowAccount.balance) + amount).toFixed(2));
 
-      const previousBalance = Number(wallet.balance);
-      const amount = Number(dto.amount);
-      const newBalance = Number((previousBalance + amount).toFixed(2));
-
-      // Update wallet balance
+      // Update user wallet balance
       await manager.getRepository(WalletEntity).update(
         { id: wallet.id },
-        { balance: newBalance },
+        { balance: newWalletBalance },
       );
 
-      // Record transaction
-      const transaction = manager.getRepository(WalletTransactionEntity).create({
+      // Update escrow account balance
+      await manager.getRepository(PlatformAccountEntity).update(
+        { id: escrowAccount.id },
+        { balance: newEscrowBalance },
+      );
+
+      // ── Entry 1: User wallet CREDIT (money arrived) ──
+      const walletTx = manager.getRepository(WalletTransactionEntity).create({
         wallet_id: wallet.id,
         type: TransactionType.CREDIT,
-        amount: amount,
-        balance_after: newBalance,
+        entry_type: EntryType.CREDIT,
+        account_type: AccountType.USER_WALLET,
+        counterpart_account_id: escrowAccount.id,
+        counterpart_account_type: AccountType.PLATFORM_ACCOUNT,
+        amount,
+        balance_after: newWalletBalance,
         description: dto.description || 'Wallet Top-Up',
+        idempotency_key: options?.idempotencyKey ?? null,
+        payment_reference: options?.paymentReference ?? null,
       });
 
-      return manager.getRepository(WalletTransactionEntity).save(transaction);
+      // ── Entry 2: Escrow account DEBIT (money went to user) ──
+      const platformTx = manager.getRepository(PlatformAccountTransactionEntity).create({
+        platform_account_id: escrowAccount.id,
+        type: TransactionType.CREDIT,
+        entry_type: PlatformEntryType.DEBIT,
+        amount,
+        balance_after: newEscrowBalance,
+        description: `Top-up credited to user wallet`,
+        counterpart_wallet_id: wallet.id,
+        idempotency_key: options?.idempotencyKey ?? null,
+        payment_reference: options?.paymentReference ?? null,
+      });
+
+      // Both entries written atomically — if either fails, both roll back
+      const [savedWalletTx] = await Promise.all([
+        manager.getRepository(WalletTransactionEntity).save(walletTx),
+        manager.getRepository(PlatformAccountTransactionEntity).save(platformTx),
+      ]);
+
+      return savedWalletTx;
+    }).catch((err) => {
+      // Idempotency key violation — same request fired twice
+      if (err instanceof QueryFailedError && (err as any).code === '23505') {
+        throw new ConflictException(
+          'This transaction has already been processed. (Duplicate idempotency key)',
+        );
+      }
+      throw err;
     });
   }
 
-  /**
-   * Debit wallet balance.
-   * Used by Phase 3 (call feature) to auto-deduct call charges.
-   * Exported from WalletModule so CallModule can inject WalletService.
-   */
+  // ─────────────────────────────────────────────────────────
+  // PUBLIC: DEBIT (used by Phase 3 — call charges)
+  //
+  // Double-entry flow:
+  //   DEBIT  User Wallet          (money leaves user)
+  //   CREDIT Platform Revenue     (money arrives at platform)
+  // ─────────────────────────────────────────────────────────
+
   async debit(
     userId: string,
     amount: number,
     description: string,
+    options?: { idempotencyKey?: string },
   ): Promise<WalletTransactionEntity> {
     return this.dataSource.transaction(async (manager) => {
-      const wallet = await manager
-        .getRepository(WalletEntity)
-        .findOne({
-          where: { user_id: userId },
-          lock: { mode: 'pessimistic_write' },
-        });
+      const [wallet, revenueAccount] = await Promise.all([
+        this.getWalletLocked(userId, manager),
+        this.getPlatformAccountLocked('revenue', manager),
+      ]);
 
-      if (!wallet) {
-        throw new NotFoundException('Wallet not found.');
-      }
+      const debitAmount = Number(Number(amount).toFixed(2));
+      const currentBalance = Number(wallet.balance);
 
-      const previousBalance = Number(wallet.balance);
-      const debitAmount = Number(amount);
-
-      // Insufficient balance check
-      if (previousBalance < debitAmount) {
+      if (currentBalance < debitAmount) {
         throw new BadRequestException(
-          `Insufficient balance. Available: ₹${previousBalance.toFixed(2)}, Required: ₹${debitAmount.toFixed(2)}`,
+          `Insufficient balance. Available: ₹${currentBalance.toFixed(2)}, Required: ₹${debitAmount.toFixed(2)}`,
         );
       }
 
-      const newBalance = Number((previousBalance - debitAmount).toFixed(2));
+      const newWalletBalance = Number((currentBalance - debitAmount).toFixed(2));
+      const newRevenueBalance = Number((Number(revenueAccount.balance) + debitAmount).toFixed(2));
 
       await manager.getRepository(WalletEntity).update(
         { id: wallet.id },
-        { balance: newBalance },
+        { balance: newWalletBalance },
       );
 
-      const transaction = manager.getRepository(WalletTransactionEntity).create({
+      await manager.getRepository(PlatformAccountEntity).update(
+        { id: revenueAccount.id },
+        { balance: newRevenueBalance },
+      );
+
+      // ── Entry 1: User wallet DEBIT ──
+      const walletTx = manager.getRepository(WalletTransactionEntity).create({
         wallet_id: wallet.id,
         type: TransactionType.DEBIT,
+        entry_type: EntryType.DEBIT,
+        account_type: AccountType.USER_WALLET,
+        counterpart_account_id: revenueAccount.id,
+        counterpart_account_type: AccountType.PLATFORM_ACCOUNT,
         amount: debitAmount,
-        balance_after: newBalance,
+        balance_after: newWalletBalance,
         description,
+        idempotency_key: options?.idempotencyKey ?? null,
       });
 
-      return manager.getRepository(WalletTransactionEntity).save(transaction);
+      // ── Entry 2: Revenue account CREDIT ──
+      const platformTx = manager.getRepository(PlatformAccountTransactionEntity).create({
+        platform_account_id: revenueAccount.id,
+        type: TransactionType.CREDIT,
+        entry_type: PlatformEntryType.CREDIT,
+        amount: debitAmount,
+        balance_after: newRevenueBalance,
+        description: `Call charge from user`,
+        counterpart_wallet_id: wallet.id,
+        idempotency_key: options?.idempotencyKey ?? null,
+      });
+
+      const [savedWalletTx] = await Promise.all([
+        manager.getRepository(WalletTransactionEntity).save(walletTx),
+        manager.getRepository(PlatformAccountTransactionEntity).save(platformTx),
+      ]);
+
+      return savedWalletTx;
+    }).catch((err) => {
+      if (err instanceof QueryFailedError && (err as any).code === '23505') {
+        throw new ConflictException('Duplicate transaction. Already processed.');
+      }
+      throw err;
     });
   }
 
-  /**
-   * Get paginated transaction history for a user's wallet.
-   * Ordered by created_at DESC (newest first).
-   * Returns total count so frontend can render pagination.
-   */
+  // ─────────────────────────────────────────────────────────
+  // PUBLIC: PAGINATED TRANSACTION HISTORY
+  // ─────────────────────────────────────────────────────────
+
   async getTransactions(
     userId: string,
     query: TransactionQueryDto,
-  ): Promise<{ transactions: WalletTransactionEntity[]; total: number; page: number; limit: number }> {
+  ): Promise<{
+    transactions: WalletTransactionEntity[];
+    total: number;
+    page: number;
+    limit: number;
+  }> {
     const wallet = await this.getWalletByUserId(userId);
-
     const page = query.page ?? 1;
     const limit = query.limit ?? 10;
     const skip = (page - 1) * limit;
