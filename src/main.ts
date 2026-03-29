@@ -2,6 +2,7 @@ import { NestFactory } from '@nestjs/core';
 import { ValidationPipe } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import helmet from 'helmet';
+import rateLimit from 'express-rate-limit';
 import { AppModule } from './app.module';
 import { ResponseInterceptor } from './common/interceptors/response.interceptor';
 import { HttpExceptionFilter } from './common/filters/http-exception.filter';
@@ -11,18 +12,50 @@ async function bootstrap() {
   const config = app.get(ConfigService);
   const isDev = config.get('APP_ENV') === 'development';
 
-  // ─── Security Headers (Helmet) ───────────────────────────────────────────
-  // Sets: X-Content-Type-Options, X-Frame-Options, X-XSS-Protection,
-  // Strict-Transport-Security, Content-Security-Policy, etc.
-  // Must be first middleware registered.
+  // ─── Security Headers ────────────────────────────────────────────
   app.use(
     helmet({
-      // Allow Google OAuth redirects through CSP
       contentSecurityPolicy: isDev ? false : undefined,
     }),
   );
 
-  // ─── CORS ────────────────────────────────────────────────────────────────
+  // ─── Rate Limiting ───────────────────────────────────────────────
+  // Global: 200 requests per 15 minutes per IP
+  app.use(
+    rateLimit({
+      windowMs: 15 * 60 * 1000,
+      max: 200,
+      standardHeaders: true,
+      legacyHeaders: false,
+      message: { success: false, message: ['Too many requests. Please slow down.'] },
+    }),
+  );
+
+  // Strict: wallet top-up — 10 per 15 minutes per IP
+  app.use(
+    '/api/v1/wallet/topup',
+    rateLimit({
+      windowMs: 15 * 60 * 1000,
+      max: 10,
+      standardHeaders: true,
+      legacyHeaders: false,
+      message: { success: false, message: ['Too many top-up attempts. Try again later.'] },
+    }),
+  );
+
+  // Strict: call initiation — 20 per 15 minutes per IP
+  app.use(
+    '/api/v1/calls/initiate',
+    rateLimit({
+      windowMs: 15 * 60 * 1000,
+      max: 20,
+      standardHeaders: true,
+      legacyHeaders: false,
+      message: { success: false, message: ['Too many call attempts. Try again later.'] },
+    }),
+  );
+
+  // ─── CORS ────────────────────────────────────────────────────────
   app.enableCors({
     origin: config.get('FRONTEND_URL'),
     credentials: true,
@@ -30,22 +63,20 @@ async function bootstrap() {
     allowedHeaders: ['Content-Type', 'Authorization'],
   });
 
-  // ─── Global Prefix ───────────────────────────────────────────────────────
+  // ─── Global Prefix ───────────────────────────────────────────────
   app.setGlobalPrefix('api/v1');
 
-  // ─── Global Validation Pipe ──────────────────────────────────────────────
+  // ─── Validation ──────────────────────────────────────────────────
   app.useGlobalPipes(
     new ValidationPipe({
-      whitelist: true,           // strip fields not in DTO
-      forbidNonWhitelisted: true, // throw on extra fields
-      transform: true,           // auto-cast types (string -> number etc.)
+      whitelist: true,
+      forbidNonWhitelisted: true,
+      transform: true,
     }),
   );
 
-  // ─── Global Response Interceptor ─────────────────────────────────────────
+  // ─── Interceptors & Filters ──────────────────────────────────────
   app.useGlobalInterceptors(new ResponseInterceptor());
-
-  // ─── Global Exception Filter ─────────────────────────────────────────────
   app.useGlobalFilters(new HttpExceptionFilter());
 
   const port = config.get<number>('APP_PORT') || 3000;

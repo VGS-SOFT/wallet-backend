@@ -9,6 +9,7 @@ import { AppService } from './app.service';
 import { AuthModule } from './modules/auth/auth.module';
 import { UsersModule } from './modules/users/users.module';
 import { WalletModule } from './modules/wallet/wallet.module';
+import { CallsModule } from './modules/calls/calls.module';
 import { JwtAuthGuard } from './common/guards/jwt-auth.guard';
 
 @Module({
@@ -19,7 +20,7 @@ import { JwtAuthGuard } from './common/guards/jwt-auth.guard';
     UsersModule,
     AuthModule,
     WalletModule,
-    // CallModule, <-- Phase 3
+    CallsModule,
   ],
   controllers: [AppController],
   providers: [
